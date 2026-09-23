@@ -1,10 +1,10 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use x11rb::{
@@ -37,6 +37,7 @@ const REQUEST_PROPERTY: &[u8] = b"COPY_VAULT_SELECTION";
 pub struct X11ClipboardProvider {
     stop: Option<Arc<AtomicBool>>,
     monitor: Option<JoinHandle<()>>,
+    last_error: Arc<Mutex<Option<ClipboardError>>>,
 }
 
 impl X11ClipboardProvider {
@@ -44,18 +45,23 @@ impl X11ClipboardProvider {
         Self {
             stop: None,
             monitor: None,
+            last_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn last_error(&self) -> Option<ClipboardError> {
+        self.last_error.lock().ok().and_then(|error| error.clone())
     }
 
     fn monitor(
         stop: Arc<AtomicBool>,
+        last_error: Arc<Mutex<Option<ClipboardError>>>,
         events: Box<dyn Fn(ClipboardEvent) + Send + 'static>,
     ) -> ClipboardResult<()> {
         let (connection, screen, atoms) = connect()?;
         let root = connection.setup().roots[screen].root;
         let requestor = create_requestor(&connection, root)?;
-
-        connection
+        let result = connection
             .xfixes_select_selection_input(
                 root,
                 atoms.clipboard,
@@ -63,43 +69,19 @@ impl X11ClipboardProvider {
             )
             .map_err(connection_error)?
             .check()
-            .map_err(connection_error)?;
-        connection.flush().map_err(connection_error)?;
-
-        let mut last_text = None;
-        while !stop.load(Ordering::Acquire) {
-            let Some(event) = connection.poll_for_event().map_err(connection_error)? else {
-                thread::sleep(Duration::from_millis(20));
-                continue;
-            };
-
-            let Event::XfixesSelectionNotify(selection) = event else {
-                continue;
-            };
-            if selection.selection != atoms.clipboard || selection.owner == x11rb::NONE {
-                continue;
-            }
-
-            let Ok(text) = read_text(&connection, requestor, &atoms) else {
-                continue;
-            };
-            if is_duplicate(last_text.as_deref(), &text) {
-                continue;
-            }
-            last_text = Some(text.clone());
-
-            events(ClipboardEvent {
-                formats: vec![MimeType::text_plain()],
-                data: Some(ClipboardData::text(text)),
+            .map_err(connection_error)
+            .and_then(|_| connection.flush().map_err(connection_error))
+            .and_then(|_| {
+                monitor_events(&connection, requestor, &atoms, &stop, &last_error, events)
             });
-        }
 
-        connection
+        let cleanup = connection
             .destroy_window(requestor)
             .map_err(connection_error)?
             .check()
-            .map_err(connection_error)?;
-        Ok(())
+            .map_err(connection_error);
+
+        result.and(cleanup)
     }
 }
 
@@ -139,8 +121,11 @@ impl ClipboardProvider for X11ClipboardProvider {
         let (_, _, _) = connect()?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let last_error = Arc::clone(&self.last_error);
         self.monitor = Some(thread::spawn(move || {
-            let _ = Self::monitor(thread_stop, events);
+            if let Err(error) = Self::monitor(thread_stop, last_error.clone(), events) {
+                record_error(&last_error, error);
+            }
         }));
         self.stop = Some(stop);
         Ok(())
@@ -171,7 +156,7 @@ impl ClipboardProvider for X11ClipboardProvider {
         let (connection, screen, atoms) = connect()?;
         let root = connection.setup().roots[screen].root;
         let requestor = create_requestor(&connection, root)?;
-        let result = read_text(&connection, requestor, &atoms).map(ClipboardData::text);
+        let result = read_text(&connection, requestor, &atoms, None).map(ClipboardData::text);
         connection
             .destroy_window(requestor)
             .map_err(connection_error)?
@@ -253,17 +238,19 @@ fn read_text(
     connection: &RustConnection,
     requestor: Window,
     atoms: &Atoms,
+    stop: Option<&AtomicBool>,
 ) -> ClipboardResult<String> {
-    let target = select_text_target(connection, requestor, atoms)?;
-    request_selection(connection, requestor, atoms, target)
+    let target = select_text_target(connection, requestor, atoms, stop)?;
+    request_selection(connection, requestor, atoms, target, stop)
 }
 
 fn select_text_target(
     connection: &RustConnection,
     requestor: Window,
     atoms: &Atoms,
+    stop: Option<&AtomicBool>,
 ) -> ClipboardResult<Atom> {
-    let reply = request_selection_property(connection, requestor, atoms, atoms.targets)?;
+    let reply = request_selection_property(connection, requestor, atoms, atoms.targets, stop)?;
     if reply.type_ == atoms.incr {
         return Err(ClipboardError::TransferFailed(
             "TARGETS transfer unexpectedly used INCR".to_owned(),
@@ -301,10 +288,11 @@ fn request_selection(
     requestor: Window,
     atoms: &Atoms,
     target: Atom,
+    stop: Option<&AtomicBool>,
 ) -> ClipboardResult<String> {
-    let reply = request_selection_property(connection, requestor, atoms, target)?;
+    let reply = request_selection_property(connection, requestor, atoms, target, stop)?;
     let bytes = if reply.type_ == atoms.incr {
-        read_incremental(connection, requestor, atoms)?
+        read_incremental(connection, requestor, atoms, stop)?
     } else {
         reply.value
     };
@@ -317,6 +305,7 @@ fn request_selection_property(
     requestor: Window,
     atoms: &Atoms,
     target: Atom,
+    stop: Option<&AtomicBool>,
 ) -> ClipboardResult<xproto::GetPropertyReply> {
     connection
         .convert_selection(
@@ -331,8 +320,13 @@ fn request_selection_property(
         .map_err(connection_error)?;
     connection.flush().map_err(connection_error)?;
 
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let event = connection.wait_for_event().map_err(connection_error)?;
+        let Some(event) = poll_event(connection, stop, deadline)? else {
+            return Err(ClipboardError::TransferFailed(
+                "timed out waiting for X11 SelectionNotify".to_owned(),
+            ));
+        };
         if let Event::SelectionNotify(SelectionNotifyEvent {
             requestor: event_requestor,
             selection,
@@ -361,6 +355,7 @@ fn read_incremental(
     connection: &RustConnection,
     requestor: Window,
     atoms: &Atoms,
+    stop: Option<&AtomicBool>,
 ) -> ClipboardResult<Vec<u8>> {
     connection
         .delete_property(requestor, atoms.request_property)
@@ -370,8 +365,13 @@ fn read_incremental(
     connection.flush().map_err(connection_error)?;
 
     let mut bytes = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let event = connection.wait_for_event().map_err(connection_error)?;
+        let Some(event) = poll_event(connection, stop, deadline)? else {
+            return Err(ClipboardError::TransferFailed(
+                "timed out waiting for X11 INCR data".to_owned(),
+            ));
+        };
         let Event::PropertyNotify(property) = event else {
             continue;
         };
@@ -403,6 +403,72 @@ fn read_incremental(
 
 fn connection_error(error: impl std::fmt::Debug) -> ClipboardError {
     ClipboardError::TransferFailed(format!("X11 clipboard operation failed: {error:?}"))
+}
+
+fn poll_event(
+    connection: &RustConnection,
+    stop: Option<&AtomicBool>,
+    deadline: Instant,
+) -> ClipboardResult<Option<Event>> {
+    loop {
+        if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(ClipboardError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if let Some(event) = connection.poll_for_event().map_err(connection_error)? {
+            return Ok(Some(event));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn record_error(last_error: &Arc<Mutex<Option<ClipboardError>>>, error: ClipboardError) {
+    if let Ok(mut slot) = last_error.lock() {
+        *slot = Some(error);
+    }
+}
+
+fn monitor_events(
+    connection: &RustConnection,
+    requestor: Window,
+    atoms: &Atoms,
+    stop: &AtomicBool,
+    last_error: &Arc<Mutex<Option<ClipboardError>>>,
+    events: Box<dyn Fn(ClipboardEvent) + Send + 'static>,
+) -> ClipboardResult<()> {
+    let mut last_text = None;
+    while !stop.load(Ordering::Acquire) {
+        let Some(event) = poll_event(
+            connection,
+            Some(stop),
+            Instant::now() + Duration::from_secs(1),
+        )?
+        else {
+            continue;
+        };
+        let Event::XfixesSelectionNotify(selection) = event else {
+            continue;
+        };
+        if selection.selection != atoms.clipboard || selection.owner == x11rb::NONE {
+            continue;
+        }
+
+        match read_text(connection, requestor, atoms, Some(stop)) {
+            Ok(text) if !is_duplicate(last_text.as_deref(), &text) => {
+                last_text = Some(text.clone());
+                events(ClipboardEvent {
+                    formats: vec![MimeType::text_plain()],
+                    data: Some(ClipboardData::text(text)),
+                });
+            }
+            Ok(_) => {}
+            Err(ClipboardError::Cancelled) => break,
+            Err(error) => record_error(last_error, error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
