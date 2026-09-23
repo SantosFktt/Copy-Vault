@@ -1,0 +1,13 @@
+[package]
+name = "copy-vault"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "A local-first clipboard manager for Ubuntu/Linux"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/SantosFktt/Copy-Vault"
+keywords = ["clipboard", "gtk", "linux", "privacy"]
+categories = ["gui", "os::linux-apis"]
+
+[dependencies]
