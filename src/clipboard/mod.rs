@@ -11,7 +11,10 @@ pub use types::{
 pub trait ClipboardProvider {
     fn capabilities(&self) -> ClipboardCapabilities;
 
-    fn start(&mut self, events: Box<dyn Fn(ClipboardEvent) + Send>) -> ClipboardResult<()>;
+    fn start(
+        &mut self,
+        events: Box<dyn Fn(ClipboardEvent) + Send + 'static>,
+    ) -> ClipboardResult<()>;
 
     fn stop(&mut self) -> ClipboardResult<()>;
 

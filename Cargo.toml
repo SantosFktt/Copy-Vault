@@ -13,3 +13,4 @@ categories = ["gui", "os::linux-apis"]
 [dependencies]
 gtk4 = "0.10"
 libadwaita = "0.8"
+x11rb = { version = "0.13", features = ["xfixes"] }

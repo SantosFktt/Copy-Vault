@@ -39,6 +39,12 @@ backend detection through GDK. The X11, Wayland, and unsupported-platform
 modules are provider slots with no monitoring implementation yet. Domain types
 remain independent of GTK, GDK, X11, and Wayland types.
 
+The X11 provider now occupies the X11 slot. It uses `x11rb` and XFixes for
+selection-owner notifications and reads UTF-8/text clipboard data through the
+ICCCM selection protocol, including incremental transfers. It is deliberately
+text-read/monitoring-only; Wayland monitoring and all persistence remain
+deferred.
+
 ## Data model requirements
 
 Editing an item creates a new immutable item. The original remains unchanged.
