@@ -33,6 +33,12 @@ application results and errors.
 The initial implementation may add these modules incrementally; empty
 abstractions must not conceal unsupported platform behavior.
 
+The first clipboard implementation adds only the domain-level
+`ClipboardProvider` contract, clipboard value types, and runtime display
+backend detection through GDK. The X11, Wayland, and unsupported-platform
+modules are provider slots with no monitoring implementation yet. Domain types
+remain independent of GTK, GDK, X11, and Wayland types.
+
 ## Data model requirements
 
 Editing an item creates a new immutable item. The original remains unchanged.
